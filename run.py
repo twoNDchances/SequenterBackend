@@ -89,6 +89,12 @@ def connect_elasticsearch():
         elasticsearch_response.indices.create(index="responser-modsecurity-executions", body=index_settings)
         info(msg='Created "responser-modsecurity-executions"')
     info(msg='"responser-modsecurity-executions" [OK]')
+    info(msg='Checking "responser-modsecurity-errorlogs" index...')
+    if not elasticsearch_response.indices.exists(index='responser-modsecurity-errorlogs'):
+        info(msg='Creating "responser-modsecurity-errorlogs"')
+        elasticsearch_response.indices.create(index="responser-modsecurity-errorlogs", body=index_settings)
+        info(msg='Created "responser-modsecurity-errorlogs"')
+    info(msg='"responser-modsecurity-errorlogs" [OK]')
     return elasticsearch_response
 
 
@@ -127,10 +133,33 @@ def processor(elasticsearch_response: Elasticsearch):
         modsecurity_executions = query_all(elasticsearch_response=elasticsearch_response)
         missing_secrule_id = find_missing_or_next([
             modsecurity_execution['_source']['secrule_id'] for modsecurity_execution in modsecurity_executions
+            if modsecurity_execution['_source']['secrule_id'] is not None
         ])
         request_body: dict = loads(body.decode())
         responser_name = request_body.get('responser_name')
         modsec_type = request_body.get('type')
+        if (
+            modsec_type in ['full', 'onlyIPAndPayload', 'onlyIPAndRegex'] and 
+            (missing_secrule_id[0] > 799997 or missing_secrule_id[1] > 799997)
+        ):
+            elasticsearch_response.index(index='responser-modsecurity-errorlogs', document={
+                'responser_name': responser_name,
+                'message': 'SecRule ID limit exceeded',
+                'pattern': f'For IP: {missing_secrule_id[0]} and for Chain {missing_secrule_id[1]}'
+            })
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
+        if (
+            modsec_type in ['onlyIP', 'onlyRegex', 'onlyPayload', 'onlyRegexAndPayload']
+            and (missing_secrule_id[0] > 799997)
+        ):
+            elasticsearch_response.index(index='responser-modsecurity-errorlogs', document={
+                'responser_name': responser_name,
+                'message': 'SecRule ID limit exceeded',
+                'pattern': f'{missing_secrule_id[0]}'
+            })
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
         details: dict = request_body.get('details')
         detail_ip: dict = details.get('ip')
         detail_source_ip = None; detail_anomaly_score = None; detail_paranoia_level = None
@@ -142,23 +171,20 @@ def processor(elasticsearch_response: Elasticsearch):
         detail_payload = details.get('payload')
         detail_hashed_rule = details.get('hashed_rule')
         detail_hashed_payload = details.get('hashed_payload')
-        payload = request_body.get('payload')
+        execution_id = request_body.get('execution_id')
+        execution_id_for_ip = request_body.get('execution_id_for_ip')
+        execution_id_for_chain = request_body.get('execution_id_for_chain')
         if modsec_type == 'full':
             double_secrule = process_double_secrule(
                 elasticsearch_response=elasticsearch_response,
-                modsecurity_executions=modsecurity_executions,
-                responser_name=responser_name,
-                modsec_type=modsec_type,
+                execution_id_for_ip=execution_id_for_ip,
+                execution_id_for_chain=execution_id_for_chain,
                 secrule_id_ip=missing_secrule_id[0],
                 secrule_id_chain=missing_secrule_id[1],
-                detail_ip=detail_source_ip,
                 anomaly_score=detail_anomaly_score,
                 paranoia_level=detail_paranoia_level,
                 detail_rule=detail_rule,
-                detail_payload=detail_payload,
-                detail_hashed_rule=detail_hashed_rule,
-                detail_hashed_payload=detail_hashed_payload,
-                payload=payload
+                detail_payload=detail_payload
             )
             channel.basic_publish(exchange='', routing_key=RABBITMQ_QUEUE_NAME_ANSWER, body=dumps({
                 'responser_name': responser_name,
@@ -186,16 +212,12 @@ def processor(elasticsearch_response: Elasticsearch):
         elif modsec_type == 'onlyRegexAndPayload':
             single_secrule = process_single_secrule(
                 elasticsearch_response=elasticsearch_response,
-                modsecurity_executions=modsecurity_executions,
-                responser_name=responser_name,
-                modsec_type=modsec_type,
+                execution_id=execution_id,
                 secrule_id=missing_secrule_id[0],
-                detail_ip=None,
+                anomaly_score=None,
+                paranoia_level=None,
                 detail_rule=detail_rule,
-                detail_payload=detail_payload,
-                detail_hashed_rule=detail_hashed_rule,
-                detail_hashed_payload=detail_hashed_payload,
-                payload=payload
+                detail_payload=detail_payload
             )
             channel.basic_publish(exchange='', routing_key=RABBITMQ_QUEUE_NAME_ANSWER, body=dumps({
                 'responser_name': responser_name,
@@ -219,16 +241,12 @@ def processor(elasticsearch_response: Elasticsearch):
         elif modsec_type == 'onlyPayload':
             single_secrule = process_single_secrule(
                 elasticsearch_response=elasticsearch_response,
-                modsecurity_executions=modsecurity_executions,
-                responser_name=responser_name,
-                modsec_type=modsec_type,
+                execution_id=execution_id,
                 secrule_id=missing_secrule_id[0],
-                detail_ip=None,
+                anomaly_score=None,
+                paranoia_level=None,
                 detail_rule=None,
-                detail_payload=detail_payload,
-                detail_hashed_rule=None,
-                detail_hashed_payload=detail_hashed_payload,
-                payload=payload
+                detail_payload=detail_payload
             )
             channel.basic_publish(exchange='', routing_key=RABBITMQ_QUEUE_NAME_ANSWER, body=dumps({
                 'responser_name': responser_name,
@@ -252,16 +270,12 @@ def processor(elasticsearch_response: Elasticsearch):
         elif modsec_type == 'onlyIP':
             single_secrule = process_single_secrule(
                 elasticsearch_response=elasticsearch_response,
-                modsecurity_executions=modsecurity_executions,
-                responser_name=responser_name,
-                modsec_type=modsec_type,
+                execution_id=execution_id,
                 secrule_id=missing_secrule_id[0],
-                detail_ip=detail_source_ip,
+                anomaly_score=detail_anomaly_score,
+                paranoia_level=detail_paranoia_level,
                 detail_rule=None,
-                detail_payload=None,
-                detail_hashed_rule=None,
-                detail_hashed_payload=None,
-                payload=payload
+                detail_payload=None
             )
             channel.basic_publish(exchange='', routing_key=RABBITMQ_QUEUE_NAME_ANSWER, body=dumps({
                 'responser_name': responser_name,
@@ -289,19 +303,14 @@ def processor(elasticsearch_response: Elasticsearch):
         elif modsec_type == 'onlyIPAndRegex':
             double_secrule = process_double_secrule(
                 elasticsearch_response=elasticsearch_response,
-                modsecurity_executions=modsecurity_executions,
-                responser_name=responser_name,
-                modsec_type=modsec_type,
+                execution_id_for_ip=execution_id_for_ip,
+                execution_id_for_chain=execution_id_for_chain,
                 secrule_id_ip=missing_secrule_id[0],
                 secrule_id_chain=missing_secrule_id[1],
-                detail_ip=detail_source_ip,
                 anomaly_score=detail_anomaly_score,
                 paranoia_level=detail_paranoia_level,
                 detail_rule=detail_rule,
-                detail_payload=None,
-                detail_hashed_rule=detail_hashed_rule,
-                detail_hashed_payload=None,
-                payload=payload
+                detail_payload=None
             )
             channel.basic_publish(exchange='', routing_key=RABBITMQ_QUEUE_NAME_ANSWER, body=dumps({
                 'responser_name': responser_name,
@@ -329,16 +338,12 @@ def processor(elasticsearch_response: Elasticsearch):
         elif modsec_type == 'onlyRegex':
             single_secrule = process_single_secrule(
                 elasticsearch_response=elasticsearch_response,
-                modsecurity_executions=modsecurity_executions,
-                responser_name=responser_name,
-                modsec_type=modsec_type,
+                execution_id=execution_id,
                 secrule_id=missing_secrule_id[0],
-                detail_ip=None,
+                anomaly_score=None,
+                paranoia_level=None,
                 detail_rule=detail_rule,
-                detail_payload=None,
-                detail_hashed_rule=detail_hashed_rule,
-                detail_hashed_payload=None,
-                payload=payload
+                detail_payload=None
             )
             channel.basic_publish(exchange='', routing_key=RABBITMQ_QUEUE_NAME_ANSWER, body=dumps({
                 'responser_name': responser_name,
@@ -362,19 +367,14 @@ def processor(elasticsearch_response: Elasticsearch):
         elif modsec_type == 'onlyIPAndPayload':
             double_secrule = process_double_secrule(
                 elasticsearch_response=elasticsearch_response,
-                modsecurity_executions=modsecurity_executions,
-                responser_name=responser_name,
-                modsec_type=modsec_type,
+                execution_id_for_ip=execution_id_for_ip,
+                execution_id_for_chain=execution_id_for_chain,
                 secrule_id_ip=missing_secrule_id[0],
                 secrule_id_chain=missing_secrule_id[1],
-                detail_ip=detail_source_ip,
                 anomaly_score=detail_anomaly_score,
                 paranoia_level=detail_paranoia_level,
                 detail_rule=None,
-                detail_payload=detail_payload,
-                detail_hashed_rule=None,
-                detail_hashed_payload=detail_hashed_payload,
-                payload=payload
+                detail_payload=detail_payload
             )
             channel.basic_publish(exchange='', routing_key=RABBITMQ_QUEUE_NAME_ANSWER, body=dumps({
                 'responser_name': responser_name,
@@ -428,155 +428,57 @@ def query_all(elasticsearch_response: Elasticsearch):
 
 def process_double_secrule(
     elasticsearch_response: Elasticsearch,
-    modsecurity_executions: list,
-    responser_name: str,
-    modsec_type: str,
+    execution_id_for_ip: str,
+    execution_id_for_chain: str,
     secrule_id_ip: int,
     secrule_id_chain: int,
-    detail_ip: str,
     anomaly_score: int,
     paranoia_level: int,
     detail_rule: str,
-    detail_payload: str,
-    detail_hashed_rule: str,
-    detail_hashed_payload: str,
-    payload: dict
+    detail_payload: str
 ):
-    modsecurity_execution_for_ip = elasticsearch_response.index(index='responser-modsecurity-executions', document={
-        'responser_name': responser_name,
+    elasticsearch_response.update(index='responser-modsecurity-executions', id=execution_id_for_ip, doc={
         'secrule_id': secrule_id_ip,
-        'type': modsec_type,
-        'for': 'ip',
-        'start': None,
-        'detail_ip': detail_ip,
         'anomaly_score': anomaly_score,
         'paranoia_level': paranoia_level,
         'detail_rule': detail_rule,
         'detail_payload': detail_payload,
-        'detail_hashed_rule': detail_hashed_rule,
-        'detail_hashed_payload': detail_hashed_payload,
-        'payload': dumps(payload),
-        'relationship': None,
-        'real_id_relationship': None,
-        'status': None
-    })
-    while True:
-        modsecurity_executions_after = query_all(elasticsearch_response=elasticsearch_response)
-        try:
-            modsecurity_execution_for_ip_after = elasticsearch_response.get(
-                index='responser-modsecurity-executions', 
-                id=modsecurity_execution_for_ip['_id']
-            )
-            if (
-                modsecurity_execution_for_ip_after.raw['_source']['secrule_id'] == secrule_id_ip and 
-                modsecurity_executions_after.__len__() > modsecurity_executions.__len__()
-            ):
-                modsecurity_executions = modsecurity_executions_after
-                break
-        except:
-            continue
-    modsecurity_execution_for_chain = elasticsearch_response.index(index='responser-modsecurity-executions', document={
-        'responser_name': responser_name,
+        'relationship': secrule_id_chain,
+    }, refresh='wait_for')
+    elasticsearch_response.update(index='responser-modsecurity-executions', id=execution_id_for_chain, doc={
         'secrule_id': secrule_id_chain,
-        'type': modsec_type,
-        'for': 'chain',
-        'start': None,
-        'detail_ip': detail_ip,
         'anomaly_score': anomaly_score,
         'paranoia_level': paranoia_level,
         'detail_rule': detail_rule,
         'detail_payload': detail_payload,
-        'detail_hashed_rule': detail_hashed_rule,
-        'detail_hashed_payload': detail_hashed_payload,
-        'payload': dumps(payload),
-        'relationship': None,
-        'real_id_relationship': None,
-        'status': None
-    })
-    while True:
-        modsecurity_executions_after = query_all(elasticsearch_response=elasticsearch_response)
-        try:
-            modsecurity_execution_for_chain_after = elasticsearch_response.get(
-                index='responser-modsecurity-executions', 
-                id=modsecurity_execution_for_chain['_id']
-            )
-            if (
-                modsecurity_execution_for_chain_after.raw['_source']['secrule_id'] == secrule_id_chain and 
-                modsecurity_executions_after.__len__() > modsecurity_executions.__len__()
-            ):
-                break
-        except:
-            continue
-    elasticsearch_response.update(
-        index='responser-modsecurity-executions',
-        id=modsecurity_execution_for_ip['_id'],
-        doc={
-            'relationship': secrule_id_chain,
-            'real_id_relationship': modsecurity_execution_for_chain['_id']
-        }
-    )
-    elasticsearch_response.update(
-        index='responser-modsecurity-executions',
-        id=modsecurity_execution_for_chain['_id'],
-        doc={
-            'relationship': secrule_id_ip,
-            'real_id_relationship': modsecurity_execution_for_ip['_id']
-        }
-    )
+        'relationship': secrule_id_ip,
+    }, refresh='wait_for')
     return (
-        modsecurity_execution_for_ip['_id'],
-        modsecurity_execution_for_chain['_id']
+        execution_id_for_ip,
+        execution_id_for_chain
     )
 
 
 def process_single_secrule(
     elasticsearch_response: Elasticsearch,
-    modsecurity_executions: list,
-    responser_name: str,
-    modsec_type: str,
+    execution_id: str,
     secrule_id: int,
-    detail_ip: str,
+    anomaly_score: int,
+    paranoia_level: int,
     detail_rule: str,
-    detail_payload: str,
-    detail_hashed_rule: str,
-    detail_hashed_payload: str,
-    payload: dict
+    detail_payload: str
 ):
-    modsecurity_execution = elasticsearch_response.index(index='responser-modsecurity-executions', document={
-        'responser_name': responser_name,
+    elasticsearch_response.update(index='responser-modsecurity-executions', id=execution_id, doc={
         'secrule_id': secrule_id,
-        'type': modsec_type,
-        'for': None,
-        'start': None,
-        'detail_ip': detail_ip,
-        'anomaly_score': None,
-        'paranoia_level': None,
+        'anomaly_score': anomaly_score,
+        'paranoia_level': paranoia_level,
         'detail_rule': detail_rule,
         'detail_payload': detail_payload,
-        'detail_hashed_rule': detail_hashed_rule,
-        'detail_hashed_payload': detail_hashed_payload,
-        'payload': dumps(payload),
-        'relationship': None,
-        'real_id_relationship': None,
-        'status': None
-    })
-    while True:
-        modsecurity_executions_after = query_all(elasticsearch_response=elasticsearch_response)
-        try:
-            modsecurity_execution_after = elasticsearch_response.get(
-                index='responser-modsecurity-executions', 
-                id=modsecurity_execution['_id']
-            )
-            if (
-                modsecurity_execution_after.raw['_source']['secrule_id'] == secrule_id and 
-                modsecurity_executions_after.__len__() > modsecurity_executions.__len__()
-            ):
-                break
-        except:
-            continue
+    }, refresh='wait_for')
     return (
-        modsecurity_execution['_id'],
+        execution_id,
     )
+
 
 if __name__ == '__main__':
     try:
